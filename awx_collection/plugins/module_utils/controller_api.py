@@ -18,6 +18,7 @@ import re
 from json import loads, dumps
 from os.path import isfile, expanduser, split, join, exists, isdir
 from os import access, R_OK, getcwd, environ, getenv
+from time import sleep
 
 
 try:
@@ -292,7 +293,7 @@ class ControllerModule(AnsibleModule):
 class ControllerAPIModule(ControllerModule):
     # TODO: Move the collection version check into controller_module.py
     # This gets set by the make process so whatever is in here is irrelevant
-    _COLLECTION_VERSION = "0.0.1-devel"
+    _COLLECTION_VERSION = "24.6.1"
     _COLLECTION_TYPE = "awx"
     # This maps the collections type (awx/tower) to the values returned by the API
     # Those values can be found in awx/api/generics.py line 204
@@ -474,6 +475,12 @@ class ControllerAPIModule(ControllerModule):
     def resolve_name_to_id(self, endpoint, name_or_id):
         return self.get_exactly_one(endpoint, name_or_id)['id']
 
+
+    def backoff_delay(self, backoff_factor, attempts):
+        # backoff algorithm
+        delay = backoff_factor * (2 ** (attempts - 1))
+        return delay
+
     def make_request(self, method, endpoint, *args, **kwargs):
         # In case someone is calling us directly; make sure we were given a method, let's not just assume a GET
         if not method:
@@ -503,56 +510,70 @@ class ControllerAPIModule(ControllerModule):
         if headers.get('Content-Type', '') == 'application/json':
             data = dumps(kwargs.get('data', {}))
 
-        try:
-            response = self.session.open(
-                method, url.geturl(),
-                headers=headers,
-                timeout=self.request_timeout,
-                validate_certs=self.verify_ssl,
-                follow_redirects=True,
-                data=data
-            )
-        except (SSLValidationError) as ssl_err:
-            self.fail_json(msg="Could not establish a secure connection to your host ({1}): {0}.".format(url.netloc, ssl_err))
-        except (ConnectionError) as con_err:
-            self.fail_json(msg="There was a network error of some kind trying to connect to your host ({1}): {0}.".format(url.netloc, con_err))
-        except (HTTPError) as he:
-            # Sanity check: Did the server send back some kind of internal error?
-            if he.code >= 500:
-                self.fail_json(msg='The host sent back a server error ({1}): {0}. Please check the logs and try again later'.format(url.path, he))
-            # Sanity check: Did we fail to authenticate properly?  If so, fail out now; this is always a failure.
-            elif he.code == 401:
-                self.fail_json(msg='Invalid authentication credentials for {0} (HTTP 401).'.format(url.path))
-            # Sanity check: Did we get a forbidden response, which means that the user isn't allowed to do this? Report that.
-            elif he.code == 403:
-                self.fail_json(msg="You don't have permission to {1} to {0} (HTTP 403).".format(url.path, method))
-            # Sanity check: Did we get a 404 response?
-            # Requests with primary keys will return a 404 if there is no response, and we want to consistently trap these.
-            elif he.code == 404:
-                if kwargs.get('return_none_on_404', False):
-                    return None
-                self.fail_json(msg='The requested object could not be found at {0}.'.format(url.path))
-            # Sanity check: Did we get a 405 response?
-            # A 405 means we used a method that isn't allowed. Usually this is a bad request, but it requires special treatment because the
-            # API sends it as a logic error in a few situations (e.g. trying to cancel a job that isn't running).
-            elif he.code == 405:
-                self.fail_json(msg="Cannot make a request with the {0} method to this endpoint {1}".format(method, url.path))
-            # Sanity check: Did we get some other kind of error?  If so, write an appropriate error message.
-            elif he.code >= 400:
-                # We are going to return a 400 so the module can decide what to do with it
-                page_data = he.read()
-                try:
-                    return {'status_code': he.code, 'json': loads(page_data)}
-                # JSONDecodeError only available on Python 3.5+
-                except ValueError:
-                    return {'status_code': he.code, 'text': page_data}
-            elif he.code == 204 and method == 'DELETE':
-                # A 204 is a normal response for a delete function
-                pass
-            else:
-                self.fail_json(msg="Unexpected return code when calling {0}: {1}".format(url.geturl(), he))
-        except (Exception) as e:
-            self.fail_json(msg="There was an unknown error when trying to connect to {2}: {0} {1}".format(type(e).__name__, e, url.geturl()))
+        backoff_factor=2
+        total=4
+
+        for attempt in range(total):
+            try:
+                response = self.session.open(
+                    method, url.geturl(),
+                    headers=headers,
+                    timeout=self.request_timeout,
+                    validate_certs=self.verify_ssl,
+                    follow_redirects=True,
+                    data=data
+                )
+                break
+            except (SSLValidationError) as ssl_err:
+                self.fail_json(msg="Could not establish a secure connection to your host ({1}): {0}.".format(url.netloc, ssl_err))
+                break
+            except (ConnectionError) as con_err:
+                self.fail_json(msg="There was a network error of some kind trying to connect to your host ({1}): {0}.".format(url.netloc, con_err))
+                break
+            except (HTTPError) as he:
+                # Sanity check: Did the server send back some kind of internal error?
+                if he.code >= 500:
+                    self.fail_json(msg='The host sent back a server error ({1}): {0}. Please check the logs and try again later'.format(url.path, he))
+                # Sanity check: Did we fail to authenticate properly?  If so, fail out now; this is always a failure.
+                elif he.code == 401:
+                    self.fail_json(msg='Invalid authentication credentials for {0} (HTTP 401).'.format(url.path))
+                # Sanity check: Did we get a forbidden response, which means that the user isn't allowed to do this? Report that.
+                elif he.code == 403:
+                    self.fail_json(msg="You don't have permission to {1} to {0} (HTTP 403).".format(url.path, method))
+                # Sanity check: Did we get a 404 response?
+                # Requests with primary keys will return a 404 if there is no response, and we want to consistently trap these.
+                elif he.code == 404:
+                    if kwargs.get('return_none_on_404', False):
+                        return None
+                    self.fail_json(msg='The requested object could not be found at {0}.'.format(url.path))
+                # Sanity check: Did we get a 405 response?
+                # A 405 means we used a method that isn't allowed. Usually this is a bad request, but it requires special treatment because the
+                # API sends it as a logic error in a few situations (e.g. trying to cancel a job that isn't running).
+                elif he.code == 405:
+                    self.fail_json(msg="Cannot make a request with the {0} method to this endpoint {1}".format(method, url.path))
+                # Sanity check: Did we get some other kind of error?  If so, write an appropriate error message.
+                elif he.code >= 400:
+                    # We are going to return a 400 so the module can decide what to do with it
+                    page_data = he.read()
+                    try:
+                        return {'status_code': he.code, 'json': loads(page_data)}
+                    # JSONDecodeError only available on Python 3.5+
+                    except ValueError:
+                        return {'status_code': he.code, 'text': page_data}
+                elif he.code == 204 and method == 'DELETE':
+                    # A 204 is a normal response for a delete function
+                    break # pass
+                else:
+                    self.fail_json(msg="Unexpected return code when calling {0}: {1}".format(url.geturl(), he))
+                break
+            except (Exception) as e:
+                if attempt < total:
+                    # retry request
+                    delay = self.backoff_delay(backoff_factor, attempt)
+                    sleep(delay)
+                    continue
+                self.fail_json(msg="There was an unknown error when trying to connect to {2}: {0} {1}".format(type(e).__name__, e, url.geturl()))
+                break
 
         if not self.version_checked:
             # In PY2 we get back an HTTPResponse object but PY2 is returning an addinfourl
@@ -626,28 +647,45 @@ class ControllerAPIModule(ControllerModule):
             # Post to the tokens endpoint with baisc auth to try and get a token
             api_token_url = (self.url._replace(path=endpoint)).geturl()
 
-            try:
-                response = self.session.open(
-                    'POST',
-                    api_token_url,
-                    validate_certs=self.verify_ssl,
-                    timeout=self.request_timeout,
-                    follow_redirects=True,
-                    force_basic_auth=True,
-                    url_username=self.username,
-                    url_password=self.password,
-                    data=dumps(login_data),
-                    headers={'Content-Type': 'application/json'},
-                )
-            except HTTPError as he:
+            backoff_factor=2
+            total=4
+
+            for attempt in range(total):
                 try:
-                    resp = he.read()
-                except Exception as e:
-                    resp = 'unknown {0}'.format(e)
-                self.fail_json(msg='Failed to get token: {0}'.format(he), response=resp)
-            except (Exception) as e:
-                # Sanity check: Did the server send back some kind of internal error?
-                self.fail_json(msg='Failed to get token: {0}'.format(e))
+                    response = self.session.open(
+                        'POST',
+                        api_token_url,
+                        validate_certs=self.verify_ssl,
+                        timeout=self.request_timeout,
+                        follow_redirects=True,
+                        force_basic_auth=True,
+                        url_username=self.username,
+                        url_password=self.password,
+                        data=dumps(login_data),
+                        headers={'Content-Type': 'application/json'},
+                    )
+                    break
+                except HTTPError as he:
+                    if attempt < total:
+                        # retry request
+                        delay = self.backoff_delay(backoff_factor, attempt)
+                        sleep(delay)
+                        continue
+                    try:
+                        resp = he.read()
+                    except Exception as e:
+                        resp = 'unknown {0}'.format(e)
+                    self.fail_json(msg='Failed to get token: {0}'.format(he), response=resp)
+                    break
+                except (Exception) as e:
+                    if attempt < total:
+                        # retry request
+                        delay = self.backoff_delay(backoff_factor, attempt)
+                        sleep(delay)
+                        continue
+                    # Sanity check: Did the server send back some kind of internal error?
+                    self.fail_json(msg='Failed to get token: {0}'.format(e))
+                    break
 
             token_response = None
             try:
